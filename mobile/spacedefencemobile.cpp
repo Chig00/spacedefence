@@ -7,6 +7,7 @@
  */
 
 #include <iostream>
+#include <list>
 #include <cmath>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_net.h>
@@ -17,19 +18,22 @@
 // System Constants
 //{
 // The program's current version.
-constexpr int VERSION[System::VERSION_LENGTH] = {1, 0, 0, 0};
+constexpr int VERSION[System::VERSION_LENGTH] = {1, 1, 1, 0};
+
+// The total number of threads used for parallel computation.
+constexpr int THREADS = 4;
 
 // Player Constants
 //{
 constexpr double PLAYER_SPEED = 1;
-constexpr double SHOT_VELOCITY = -3;
+constexpr double SHOT_VELOCITY = -2;
 //}
 
 // Enemy Constants
 //{
 constexpr double ENEMY_DELAY = 0.5;
-constexpr double ENEMY_VELOCITY = 0.05;
-constexpr double ENEMY_ACCELERATION = 0.0025;
+constexpr double ENEMY_VELOCITY = 0.1;
+constexpr double ENEMY_ACCELERATION = 0.00125;
 //}
 //}
 
@@ -239,7 +243,7 @@ constexpr double SCORE_SEPARATION = SCORE_WIDTH / 20;
 constexpr const char* ENEMY_SOURCE = "data/enemy.bmp";
 constexpr double ENEMY_WIDTH = 0.2;
 constexpr double ENEMY_HEIGHT = 0.2;
-constexpr double ENEMY_Y = -ENEMY_HEIGHT / 2;
+constexpr double ENEMY_Y = BUTTON_HEIGHT - ENEMY_HEIGHT / 2;
 constexpr double ENEMY_MIN = ENEMY_WIDTH / 2;
 constexpr double ENEMY_MAX = 1 - ENEMY_MIN;
 //}
@@ -356,7 +360,7 @@ class Shot {
                 position[1] += SHOT_VELOCITY * elapsed;
                 
                 // If the shot moved completely offscreen, it is reset.
-                if (position[1] < -SHOT_HEIGHT / 2) {
+                if (position[1] < BUTTON_HEIGHT - SHOT_HEIGHT / 2) {
                     reset();
                 }
             }
@@ -401,6 +405,47 @@ class Shot {
         std::array<double, 2> position; // The shot's coordinates.
         bool active; // True when the shot is being fired.
         double last_move; // The time when the shot was moved last.
+};
+
+/**
+ * A package that stores enemies and the thread index.
+ */
+class EnemyPackage {
+    public:
+        /**
+         * Stores the thread index and a reference to the enemies.
+         */
+        EnemyPackage(std::list<Enemy>& enemies, double data, int index) noexcept:
+            enemies(enemies),
+            data(data),
+            index(index)
+        {}
+        
+        /**
+         * Returns the reference to the enemies.
+         */
+        std::list<Enemy>& get_enemies() noexcept {
+            return enemies;
+        }
+        
+        /**
+         * Returns the data.
+         */
+        double get_data() const noexcept {
+            return data;
+        }
+        
+        /**
+         * Returns the thread index.
+         */
+        int get_index() const noexcept {
+            return index;
+        }
+        
+    private:
+        std::list<Enemy>& enemies; // The reference to the enemies.
+        double data; // Extra optional data.
+        int index; // The thread index.
 };
 
 /**
@@ -451,14 +496,23 @@ class Enemies {
             // The time of the last update is set to the present.
             last_move = now;
             
-            // The enemies are moved.
-            for (Enemy& enemy: enemies) {
-                enemy.update(elapsed);
-            }
+            // Enemy packages are created for multithreading.
+            EnemyPackage package0(enemies, elapsed, 0);
+            EnemyPackage package1(enemies, elapsed, 1);
+            EnemyPackage package2(enemies, elapsed, 2);
+            EnemyPackage package3(enemies, elapsed, 3);
+            
+            Thread thread1(Enemies::thread_update, &package1);
+            Thread thread2(Enemies::thread_update, &package2);
+            Thread thread3(Enemies::thread_update, &package3);
+            thread_update(&package0);
+            thread1.wait();
+            thread2.wait();
+            thread3.wait();
             
             // A new enemy is spawned if enough time has passed.
             if (now >= next_spawn) {
-                enemies.push_back(
+                enemies.push_front(
                     Enemy(
                         sprite,
                         new_position(),
@@ -484,14 +538,18 @@ class Enemies {
          * If it did, the enemy is removed and true is returned.
          */
         bool contact(const Shot& shot) noexcept {
-            for (int i = 0; i < enemies.size(); ++i) {
+            for (
+                auto i = enemies.crbegin();
+                i != enemies.crend();
+                ++i
+            ) {
                 if (
-                    std::abs(shot.get_x() - enemies[i].get_x())
+                    std::abs(shot.get_x() - i->get_x())
                     <= (SHOT_WIDTH + ENEMY_WIDTH) / 2
-                    && std::abs(shot.get_y() - enemies[i].get_y())
+                    && std::abs(shot.get_y() - i->get_y())
                     <= (SHOT_HEIGHT + ENEMY_HEIGHT) / 2
                 ) {
-                    enemies.erase(enemies.cbegin() + i);
+                    enemies.erase(std::next(i).base());
                     return true;
                 }
             }
@@ -505,17 +563,37 @@ class Enemies {
          * Returns false otherwise.
          */
         bool victory(double position) const noexcept {
-            for (const Enemy& enemy: enemies) {
-                if (
-                    enemy.get_y() >= 1 - ENEMY_HEIGHT / 2
-                    || enemy.get_y() >= PLAYER_Y - (PLAYER_HEIGHT + ENEMY_HEIGHT) / 2
-                    && std::abs(enemy.get_x() - position) <= (PLAYER_WIDTH + ENEMY_WIDTH) / 2
-                ) {
-                    return true;
+            const Enemy& enemy = enemies.back();
+            
+            return
+                enemy.get_y() >= 1 - ENEMY_HEIGHT / 2
+                || enemy.get_y() >= PLAYER_Y - (PLAYER_HEIGHT + ENEMY_HEIGHT) / 2
+                && std::abs(enemy.get_x() - position) <= (PLAYER_WIDTH + ENEMY_WIDTH) / 2
+            ;
+        }
+        
+        /**
+         * A static method to allow for multi-threading.
+         */
+        static int thread_update(void* data) noexcept {
+            EnemyPackage& enemy_package = *static_cast<EnemyPackage*>(data);
+            std::list<Enemy>& enemies = enemy_package.get_enemies();
+            double elapsed = enemy_package.get_data();
+            int index = enemy_package.get_index();
+            
+            // The enemies are moved.
+            for (auto i = enemies.begin(); i != enemies.end(); ++i) {
+                if (index) {
+                    --index;
+                }
+                
+                else {
+                    i->update(elapsed);
+                    index = THREADS - 1;
                 }
             }
             
-            return false;
+            return 0;
         }
         
     private:
@@ -528,7 +606,7 @@ class Enemies {
         
         Sprite sprite; // The sprite of all of the enemies.
         std::mt19937 generator; // The enemy RNG.
-        std::vector<Enemy> enemies; // The enemy store.
+        std::list<Enemy> enemies; // The enemy store.
         double last_move; // The last time when the enemies were moved.
         double next_spawn; // The last time when an enemy was spawned.
 };
@@ -954,7 +1032,7 @@ int main(int argc, char** argv) {
     // Scope to ensure destruction of objects before termination.
     {
         // The display is initialised.
-        Display display(300, 600);
+        Display display;
         
         // The audio is intialised and queued in another thread.
         AudioThread audio(AUDIO_SOURCE, AUDIO_LENGTH);
@@ -1107,3 +1185,26 @@ int main(int argc, char** argv) {
     return 0;
 }
 //}
+
+/* CHANGELOG:
+     v1.1:
+       Multiple threads are used to update enemies.
+       The oldest enemy is checked first for shot contact.
+       Only the oldest enemy is checked for game over.
+       Shot speed was decreased from 3 to 2.
+       Enemy base speed was increased from 0.075 to 0.1.
+     v1.0.3:
+       Shot speed was increased from 1.5 to 3.
+       Enemy base speed was decreased from 0.1 to 0.075.
+     v1.0.2:
+       Shot speed was decreased from 2.5 to 1.5.
+       Enemy base speed was increased from 0.05 to 0.1.
+       Enemy speed scaling was decreased from 0.0025 to 0.00125.
+       Shots now disappear after they leave the playable area.
+     v1.0.1:
+       std::list replaced std::vector as the Enemy container.
+       Missiles now spawn just off the playable screen instead of offscreen.
+       Shot speed was decreased from 3 to 2.5.
+     v1:
+       Initial release.
+ */
